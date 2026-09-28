@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Ingatlan.com Listing Exporter",
+  "short_name": "Ingatlan Export",
+  "version": "1.3.0",
+  "description": "Export ingatlan.com search results (price, area, floor, district, advertiser, phone) to an Excel file.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Ingatlan.com Listing Exporter",
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "permissions": ["storage", "unlimitedStorage", "scripting", "tabs", "notifications"],
+  "host_permissions": ["https://ingatlan.com/*", "https://www.ingatlan.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://ingatlan.com/lista/*", "https://www.ingatlan.com/lista/*"],
+      "js": ["src/parser.js", "src/content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
