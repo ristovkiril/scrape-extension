@@ -199,22 +199,47 @@
       listings.push(listing);
     });
 
-    const { lastPage, totalResults } = readPagination(doc);
+    const { lastPage, pagesExact, totalResults } = readPagination(doc);
     const nextHref = `page=${pageNumber + 1}`;
     const hasNextPage = !![...doc.querySelectorAll('a[href]')].find((a) => {
       const h = a.getAttribute('href');
       return h.includes('/lista/') && new RegExp(`[?&]${nextHref}(?:&|$)`).test(h);
     });
 
-    return { listings, hasNextPage, lastPage: Math.max(lastPage, pageNumber), totalResults };
+    return { listings, hasNextPage, lastPage: Math.max(lastPage, pageNumber), pagesExact, totalResults };
   }
 
   const RESULT_COUNT_RE = /(\d{1,3}(?:[\s\u00a0\u202f.]\d{3})+|\d+)\s*(?:db\s*)?(?:találat|hirdetés|results?\b|listings?\b|properties\b)/i;
 
+  const PAGE_COUNTER_RE = /^(\d+)\s*\/\s*(\d+)$/;
+
+  /**
+   * Total number of pages from the "1 / 9" counter next to the next-page button
+   * (inside data-controller="listings-page--extended-list"), or null if there is none.
+   */
+  function readPageCount(doc) {
+    const scopes = [...doc.querySelectorAll('[data-controller~="listings-page--extended-list"]')];
+    const fallback = !scopes.length;
+    if (fallback) scopes.push(doc.body || doc.documentElement);
+    for (const scope of scopes) {
+      for (const el of scope.querySelectorAll('div, p, span')) {
+        if (isInChrome(el) || el.closest('.listing-card')) continue;
+        const m = textOf(el).match(PAGE_COUNTER_RE);
+        if (!m || parseInt(m[1], 10) > parseInt(m[2], 10)) continue;
+        // Outside the known container, only trust a counter that sits next to a page link.
+        const row = el.parentElement && el.parentElement.parentElement;
+        if (fallback && !(row && row.querySelector('a[href*="/lista/"][href*="page="]'))) continue;
+        return parseInt(m[2], 10);
+      }
+    }
+    return null;
+  }
+
   /**
    * Pagination info of a results page.
-   * lastPage: highest page number linked. The pagination may only show nearby pages
-   * ("1 2 3 … 21"), so this is a minimum that can grow while moving through pages.
+   * lastPage: from the "1 / 9" counter when there is one (pagesExact = true). Otherwise
+   * the highest page number linked; the pagination may only show nearby pages
+   * ("1 2 3 … 21"), so that is a minimum that can grow while moving through pages.
    * totalResults: the "412 találat" style counter, when the page shows one.
    */
   function readPagination(doc) {
@@ -223,6 +248,9 @@
       const m = a.getAttribute('href').match(/[?&]page=(\d+)/);
       if (m) lastPage = Math.max(lastPage, parseInt(m[1], 10));
     });
+    const pageCount = readPageCount(doc);
+    const pagesExact = pageCount != null;
+    if (pagesExact) lastPage = pageCount;
 
     let totalResults = null;
     const candidates = [...doc.querySelectorAll('h1, h2, h3, [class*="count" i], [class*="result" i], [data-testid*="count" i]')];
@@ -234,7 +262,7 @@
         break;
       }
     }
-    return { lastPage, totalResults };
+    return { lastPage, pagesExact, totalResults };
   }
 
   // ---------- detail page ----------
@@ -326,6 +354,55 @@
     };
   }
 
+  // ---------- phone numbers on a live page ----------
+
+  const PHONE_BUTTON_RE = /telefonsz[aá]m|telefon|phone/i;
+
+  /**
+   * Clicks the "show phone number" button(s) and returns the numbers that appear.
+   * Needs the page's own scripts, so it only works on a live page (the worker tab or
+   * the on-page listing window), not on fetched HTML.
+   * @param {Document} doc
+   * @param {{ click?: boolean, beforeClick?: (button: Element) => Promise<void> }} [opts]
+   *   beforeClick runs before each click, e.g. to animate it.
+   */
+  async function revealPhoneNumbers(doc, { click = true, beforeClick } = {}) {
+    const inPageChrome = (el) => !!el.closest('header, footer, nav');
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    const buttons = [...doc.querySelectorAll('button, a[role="button"], a[href="#"], [data-action*="phone" i]')].filter(
+      (b) =>
+        !inPageChrome(b) &&
+        !(b.getAttribute('href') || '').startsWith('tel:') &&
+        PHONE_BUTTON_RE.test(b.textContent + ' ' + (b.getAttribute('aria-label') || ''))
+    );
+
+    const collect = () => {
+      const found = [];
+      doc.querySelectorAll('a[href^="tel:"]').forEach((a) => {
+        if (!inPageChrome(a)) found.push(decodeURIComponent(a.getAttribute('href').slice(4)).trim());
+      });
+      const zones = buttons.map((b) => b.parentElement && b.parentElement.parentElement).filter(Boolean);
+      doc.querySelectorAll('.modal.show, [role="dialog"]').forEach((m) => zones.push(m));
+      zones.forEach((z) => (z.textContent.match(PHONE_RE) || []).forEach((p) => found.push(p.trim())));
+      return [...new Set(found)];
+    };
+
+    let clicked = 0;
+    if (click && buttons.length) {
+      const before = collect().length;
+      for (const b of buttons.slice(0, 2)) {
+        if (!b.isConnected) continue;
+        if (beforeClick) await beforeClick(b);
+        b.click();
+        clicked++;
+      }
+      for (let waited = 0; waited < 8000 && collect().length <= before; waited += 300) await sleep(300);
+      await sleep(300);
+    }
+    return { phones: collect(), clicked };
+  }
+
   // ---------- misc ----------
 
   function isChallengePage(html) {
@@ -339,6 +416,7 @@
     parseAddress,
     parsePrice,
     isChallengePage,
+    revealPhoneNumbers,
     PHONE_RE,
   };
 })(typeof window !== 'undefined' ? window : self);

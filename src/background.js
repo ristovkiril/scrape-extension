@@ -1,10 +1,11 @@
 /*
  * Background service worker.
  *
- * The scraping loop itself runs in the content script of the results tab (it
- * lives as long as that tab, and its fetches carry the user's cookies). This
- * worker only does what a content script cannot: drive a separate "worker" tab
- * that loads listing pages like a real visit. That is used
+ * The scraping itself runs in content scripts (see src/content.js). In a live run
+ * the tab moves from page to page by itself; this worker only tells a page which
+ * tab it is in and ends the run if the tab is closed or Stop is pressed.
+ * In a background run, this worker does what a content script cannot: drive a
+ * separate "worker" tab that loads listing pages like a real visit. That is used
  *   - when a plain fetch() is blocked (Cloudflare challenge / 403), and
  *   - to click "show phone number" buttons, which needs the page's own JS.
  */
@@ -97,6 +98,14 @@ async function setHumanCheck(active, tabId) {
   }
 }
 
+/** The tab showing the current security check: the worker tab, or the results tab when it is shown there. */
+async function checkTabId() {
+  const { humanCheck } = await chrome.storage.local.get('humanCheck');
+  if (humanCheck && humanCheck.active && humanCheck.tabId != null) return humanCheck.tabId;
+  const { workerTabId } = await chrome.storage.session.get('workerTabId');
+  return workerTabId ?? null;
+}
+
 async function focusTab(tabId) {
   const tab = await chrome.tabs.update(tabId, { active: true });
   await chrome.windows.update(tab.windowId, { focused: true });
@@ -106,9 +115,11 @@ async function focusTab(tabId) {
  * Waits until the worker tab shows a real page instead of a Cloudflare check.
  * Automatic checks pass by themselves; for "confirm you are human" the tab is
  * brought to the front so the user can complete it. We never interact with it.
+ * Once it is done, the user is taken back to `returnTabId` (the results tab, where
+ * the live view only animates while it is visible).
  * @returns {Promise<{challenged: boolean, needsHuman?: boolean}>}
  */
-async function waitForChallenge(tabId, resume) {
+async function waitForChallenge(tabId, resume, returnTabId) {
   let challenged = !!resume;
   if (!resume) {
     const autoUntil = Date.now() + CHALLENGE_AUTO_WAIT_MS;
@@ -131,54 +142,34 @@ async function waitForChallenge(tabId, resume) {
     await delay(1500);
   }
   await setHumanCheck(false);
+  await returnFromCheck(tabId, returnTabId);
   return { challenged: true };
 }
 
-/**
- * Injected into the worker tab. Must be self-contained (no closures).
- * Optionally clicks the "show phone number" button(s), then returns the page HTML
- * and any phone numbers visible near those buttons.
- */
-async function extractInPage(revealPhone) {
-  const PHONE_RE = /(?:\+\s?36|06)[\s\-/()]*\d{1,2}[\s\-/()]*\d{3}[\s\-]*\d{3,4}/g;
-  const BUTTON_RE = /telefonsz[aá]m|telefon|phone/i;
-  const inChrome = (el) => !!el.closest('header, footer, nav');
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-  const buttons = [...document.querySelectorAll('button, a[role="button"], a[href="#"], [data-action*="phone" i]')].filter(
-    (b) => !inChrome(b) && !(b.getAttribute('href') || '').startsWith('tel:') && BUTTON_RE.test(b.textContent + ' ' + (b.getAttribute('aria-label') || ''))
-  );
-
-  const collect = () => {
-    const found = [];
-    document.querySelectorAll('a[href^="tel:"]').forEach((a) => {
-      if (!inChrome(a)) found.push(decodeURIComponent(a.getAttribute('href').slice(4)).trim());
-    });
-    const zones = buttons.map((b) => b.parentElement && b.parentElement.parentElement).filter(Boolean);
-    document.querySelectorAll('.modal.show, [role="dialog"]').forEach((m) => zones.push(m));
-    zones.forEach((z) => (z.textContent.match(PHONE_RE) || []).forEach((p) => found.push(p.trim())));
-    return [...new Set(found)];
-  };
-
-  let clicked = 0;
-  if (revealPhone && buttons.length) {
-    const before = collect().length;
-    for (const b of buttons.slice(0, 2)) {
-      b.click();
-      clicked++;
-    }
-    for (let waited = 0; waited < 8000 && collect().length <= before; waited += 300) await sleep(300);
-    await sleep(300);
-  }
-
-  return { html: document.documentElement.outerHTML, phones: collect(), clicked };
+/** Back to the results tab, unless the user has already moved on from the check tab. */
+async function returnFromCheck(checkTabId, returnTabId) {
+  if (returnTabId == null || returnTabId === checkTabId) return;
+  try {
+    const checkTab = await chrome.tabs.get(checkTabId);
+    if (checkTab.active) await focusTab(returnTabId);
+  } catch (_) {}
 }
 
-async function renderInWorker(url, revealPhone, resume) {
+/**
+ * Injected into the worker tab after src/parser.js. Optionally clicks the "show
+ * phone number" button(s), then returns the page HTML and the phone numbers found.
+ */
+async function extractInPage(revealPhone) {
+  const res = await self.IngatlanParser.revealPhoneNumbers(document, { click: revealPhone });
+  return { html: document.documentElement.outerHTML, ...res };
+}
+
+async function renderInWorker(url, revealPhone, resume, returnTabId) {
   const tabId = await getWorkerTabId();
   if (!resume) await navigateAndWait(tabId, url);
-  const { challenged, needsHuman } = await waitForChallenge(tabId, resume);
+  const { challenged, needsHuman } = await waitForChallenge(tabId, resume, returnTabId);
   if (needsHuman) return { needsHuman: true, challenged: true };
+  await chrome.scripting.executeScript({ target: { tabId }, files: ['src/parser.js'] });
   const [{ result }] = await chrome.scripting.executeScript({
     target: { tabId },
     func: extractInPage,
@@ -188,7 +179,7 @@ async function renderInWorker(url, revealPhone, resume) {
 }
 
 const LIST_TAB_URLS = ['https://ingatlan.com/lista/*', 'https://www.ingatlan.com/lista/*'];
-const CONTENT_FILES = ['src/parser.js', 'src/content.js'];
+const CONTENT_FILES = ['src/parser.js', 'src/stage.js', 'src/content.js'];
 
 function baseListUrl(url) {
   try {
@@ -232,15 +223,42 @@ async function startSavedRun(kind, mode) {
     tab = await chrome.tabs.create({ url: sourceUrl, active: false });
     await waitForTabComplete(tab.id);
   }
-  try {
-    await chrome.tabs.sendMessage(tab.id, { type: 'ping' });
-  } catch (_) {
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: CONTENT_FILES });
-  }
-  await chrome.tabs.sendMessage(tab.id, { type: 'start', kind, mode });
+  await startInTab(tab.id, kind, mode);
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+async function startInTab(tabId, kind, mode) {
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: 'ping' });
+  } catch (_) {
+    await chrome.scripting.executeScript({ target: { tabId }, files: CONTENT_FILES });
+  }
+  await chrome.tabs.sendMessage(tabId, { type: 'start', kind, mode });
+}
+
+// ---------- live runs ----------
+//
+// A live run moves its own tab from page to page (see src/content.js); its position
+// is kept in storage.local "tabRun". Stopping it from the popup, or closing its tab,
+// has to work even while the tab is between two pages, so it is handled here too.
+
+async function stopTabRun(message) {
+  const { tabRun, status } = await chrome.storage.local.get(['tabRun', 'status']);
+  if (!tabRun) return;
+  await chrome.storage.local.remove('tabRun');
+  if (status && status.running && status.runId === tabRun.runId) {
+    await chrome.storage.local.set({ status: { ...status, running: false, phase: 'stopped', message, updatedAt: Date.now() } });
+  }
+}
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const { tabRun } = await chrome.storage.local.get('tabRun');
+  if (tabRun && tabRun.tabId === tabId) {
+    await setHumanCheck(false);
+    await stopTabRun('Interrupted — the tab was closed. Download what you have, or continue.');
+  }
+});
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'startRun') {
     startSavedRun(msg.kind, msg.mode)
       .then(() => sendResponse({ ok: true }))
@@ -254,18 +272,29 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg.type === 'abortWorker') {
     aborted = true;
-    setHumanCheck(false).then(() => sendResponse({ ok: true }));
+    stopTabRun('Stopped — download what you have, or continue.')
+      .then(() => setHumanCheck(false))
+      .then(() => sendResponse({ ok: true }));
     return true;
   }
   if (msg.type === 'focusWorker') {
-    chrome.storage.session.get('workerTabId').then(({ workerTabId }) => {
-      if (workerTabId != null) focusTab(workerTabId).catch(() => {});
+    checkTabId().then((tabId) => {
+      if (tabId != null) focusTab(tabId).catch(() => {});
       sendResponse({ ok: true });
     });
     return true;
   }
+  if (msg.type === 'whoami') {
+    sendResponse({ tabId: sender.tab ? sender.tab.id : null });
+    return false;
+  }
+  if (msg.type === 'humanCheck') {
+    // A live run's tab is showing a "confirm you're human" check (or it passed).
+    setHumanCheck(!!msg.active, sender.tab && sender.tab.id).then(() => sendResponse({ ok: true }));
+    return true;
+  }
   if (msg.type === 'renderPage') {
-    renderInWorker(msg.url, msg.revealPhone, msg.resume)
+    renderInWorker(msg.url, msg.revealPhone, msg.resume, sender.tab && sender.tab.id)
       .then((res) => sendResponse({ ok: true, ...res }))
       .catch((err) => sendResponse({ ok: false, error: String(err && err.message ? err.message : err) }));
     return true; // async response
@@ -342,8 +371,8 @@ chrome.storage.onChanged.addListener(async (changes, area) => {
 chrome.notifications.onClicked.addListener(async (id) => {
   chrome.notifications.clear(id);
   if (id === NOTE_HUMAN) {
-    const { workerTabId } = await chrome.storage.session.get('workerTabId');
-    if (workerTabId != null) await focusTab(workerTabId).catch(() => {});
+    const tabId = await checkTabId();
+    if (tabId != null) await focusTab(tabId).catch(() => {});
   } else if (id === NOTE_FINISHED) {
     await focusScrapeTab();
     // Opening the popup programmatically needs Chrome 127+; otherwise the user clicks the icon.

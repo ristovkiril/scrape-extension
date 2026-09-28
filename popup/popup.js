@@ -1,10 +1,10 @@
 'use strict';
 
-const DEFAULT_OPTIONS = { mode: 'quick', maxPages: 100, delayMs: 2500 };
+const DEFAULT_OPTIONS = { mode: 'quick', maxPages: 100, delayMs: 2500, showOnPage: true };
 const OPTIONS_VERSION = 3;
 const SITE_RE = /^https:\/\/(www\.)?ingatlan\.com\//;
 const LIST_RE = /^https:\/\/(www\.)?ingatlan\.com\/lista\//;
-const CONTENT_FILES = ['src/parser.js', 'src/content.js'];
+const CONTENT_FILES = ['src/parser.js', 'src/stage.js', 'src/content.js'];
 
 const $ = (id) => document.getElementById(id);
 
@@ -13,7 +13,7 @@ const isRunning = (s) => !!(s && s.running && Date.now() - (s.updatedAt || 0) < 
 
 let activeTab = null;
 let pageState = 'checking'; // invalid | notList | empty | ready
-let pageInfo = { cardCount: 0, lastPage: 1, totalResults: null };
+let pageInfo = { cardCount: 0, lastPage: 1, pagesExact: false, totalResults: null };
 let showStartAgain = false;
 let shownCount = 0;
 
@@ -38,6 +38,7 @@ function selectedMode() {
 function renderOptions(o) {
   $('maxPages').value = o.maxPages;
   $('delayMs').value = o.delayMs;
+  $('showOnPage').checked = o.showOnPage !== false;
   const radio = document.querySelector(`input[name="mode"][value="${o.mode}"]`);
   if (radio) radio.checked = true;
   renderEstimates();
@@ -49,6 +50,7 @@ function readOptions() {
     mode: selectedMode(),
     maxPages: Math.max(1, parseInt($('maxPages').value, 10) || DEFAULT_OPTIONS.maxPages),
     delayMs: Math.max(1000, parseInt($('delayMs').value, 10) || DEFAULT_OPTIONS.delayMs),
+    showOnPage: $('showOnPage').checked,
   };
 }
 
@@ -60,9 +62,10 @@ async function saveOptions() {
 
 // Mirrors the pacing in src/content.js: a random wait of delay…1.6×delay between
 // requests and a 30–60 s break every 25 requests. Load times are typical values:
-// a fetched page takes ~1 s, a listing opened in a tab + phone reveal ~4–8 s.
+// a fetched page takes ~1 s, a page opened in the tab (live view) ~2–4 s, and a
+// listing opened in a tab + phone reveal ~4–8 s.
 const PACING = { breakEvery: 25, breakSec: [30, 60], delaySpread: 1.6 };
-const LOAD_SEC = { page: [0.8, 1.5], phone: [4, 8] };
+const LOAD_SEC = { page: [0.8, 1.5], visit: [2, 4], phone: [4, 8] };
 
 function searchSize(maxPages) {
   const perPage = pageInfo.cardCount || 20;
@@ -77,7 +80,7 @@ function searchSize(maxPages) {
     pages = maxPages;
     listings = Math.min(listings, maxPages * perPage);
   }
-  return { pages, listings, limited, exact: !!pageInfo.totalResults };
+  return { pages, listings, limited, exact: !!pageInfo.totalResults || pageInfo.pagesExact };
 }
 
 const avg = ([a, b]) => (a + b) / 2;
@@ -89,11 +92,11 @@ const avg = ([a, b]) => (a + b) / 2;
  */
 function estimateSeconds(mode, pages, listings, delayMs) {
   const delay = avg([delayMs / 1000, (delayMs / 1000) * PACING.delaySpread]);
-  const detailLoad = avg(mode === 'full' ? LOAD_SEC.phone : LOAD_SEC.page);
+  const pageLoad = avg($('showOnPage').checked ? LOAD_SEC.visit : LOAD_SEC.page);
+  const detailLoad = mode === 'full' ? avg(LOAD_SEC.phone) : pageLoad;
   const detailRequests = mode === 'quick' ? 0 : listings;
   const breaks = Math.floor((pages + detailRequests) / PACING.breakEvery);
-  const typical =
-    pages * (delay + avg(LOAD_SEC.page)) + detailRequests * (delay + detailLoad) + breaks * avg(PACING.breakSec);
+  const typical = pages * (delay + pageLoad) + detailRequests * (delay + detailLoad) + breaks * avg(PACING.breakSec);
   return [typical * 0.85, typical * 1.2];
 }
 
@@ -148,7 +151,7 @@ function renderNextSteps(job, rows, visible) {
   const pending = rows.filter((r) => needsVisit(r, job.mode)).length;
   if (pagesLeft || pending) {
     const parts = [];
-    if (pagesLeft) parts.push(`Result pages from page ${job.nextPage} (of ${job.lastPageSeen}+)`);
+    if (pagesLeft) parts.push(`Result pages from page ${job.nextPage} (of ${job.lastPageSeen}${job.pagesExact ? '' : '+'})`);
     if (pending) parts.push(`${pending} listing${pending === 1 ? '' : 's'} still need ${MODE_WORK[job.mode]}`);
     const listings = pending + (job.mode === 'quick' ? 0 : pagesLeft * perPage);
     const eta = fmtRange(estimateSeconds(job.mode, pagesLeft, listings, delayMs));
@@ -181,9 +184,11 @@ function renderEstimates() {
   });
 
   const pagesText = `${pages} page${pages === 1 ? '' : 's'}`;
-  $('searchSize').innerHTML = exact
+  $('searchSize').innerHTML = pageInfo.totalResults
     ? `<strong>${listings.toLocaleString()}</strong> properties on <strong>${pagesText}</strong>`
-    : `<strong>${pageInfo.cardCount}</strong> properties on this page · at least <strong>${pagesText}</strong> (~${listings.toLocaleString()} properties)`;
+    : exact
+      ? `<strong>${pagesText}</strong> · ~${listings.toLocaleString()} properties`
+      : `<strong>${pageInfo.cardCount}</strong> properties on this page · at least <strong>${pagesText}</strong> (~${listings.toLocaleString()} properties)`;
 
   $('estimateNote').textContent = limited
     ? `Limited to ${maxPages} pages (see Settings).`
@@ -226,12 +231,23 @@ async function checkPage() {
     pageInfo = {
       cardCount: (res && res.cardCount) || 0,
       lastPage: (res && res.lastPage) || 1,
+      pagesExact: !!(res && res.pagesExact),
       totalResults: (res && res.totalResults) || null,
     };
   } catch (_) {
-    pageInfo = { cardCount: 0, lastPage: 1, totalResults: null };
+    pageInfo = { cardCount: 0, lastPage: 1, pagesExact: false, totalResults: null };
   }
-  return (pageState = pageInfo.cardCount > 0 ? 'ready' : 'empty');
+  pageState = pageInfo.cardCount > 0 ? 'ready' : 'empty';
+  if (pageState === 'ready' && pageInfo.pagesExact) applyPageCount(pageInfo.lastPage);
+  return pageState;
+}
+
+/** The search's page count ("1 / 9" on the page) becomes the Max pages setting and its upper limit. */
+function applyPageCount(pages) {
+  const input = $('maxPages');
+  input.max = pages;
+  input.value = pages;
+  saveOptions();
 }
 
 // ---------- rendering ----------
@@ -335,6 +351,11 @@ async function init() {
   await render();
 
   document.querySelectorAll('input[name="mode"]').forEach((r) => r.addEventListener('change', saveOptions));
+  $('showOnPage').addEventListener('change', () => {
+    renderEstimates();
+    render();
+    saveOptions();
+  });
   ['maxPages', 'delayMs'].forEach((id) =>
     $(id).addEventListener('input', () => {
       renderEstimates();
@@ -356,8 +377,11 @@ async function init() {
   });
 
   $('stop').addEventListener('click', async () => {
-    const tabs = await chrome.tabs.query({ url: ['https://ingatlan.com/lista/*', 'https://www.ingatlan.com/lista/*'] });
+    // A live run may be on a listing page, so tell every ingatlan.com tab.
+    const tabs = await chrome.tabs.query({ url: ['https://ingatlan.com/*', 'https://www.ingatlan.com/*'] });
     await Promise.all(tabs.map((t) => chrome.tabs.sendMessage(t.id, { type: 'stop' }).catch(() => {})));
+    // Also ends a live run whose tab is between two pages right now.
+    await chrome.runtime.sendMessage({ type: 'abortWorker' }).catch(() => {});
   });
 
   $('download').addEventListener('click', async () => {

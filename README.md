@@ -33,7 +33,8 @@ The Link column is clickable, and the header row has filters turned on.
 ```
 manifest.json         Chrome extension manifest (Manifest V3)
 src/parser.js         All ingatlan.com-specific parsing (selectors, Hungarian labels)
-src/content.js        Runs on /lista/ pages: the scraping loop (keeps running when the popup closes)
+src/content.js        Runs on ingatlan.com pages: the scraping (live: one step per page load; background: a fetch loop on the results page)
+src/stage.js          The live view (spotlight, highlights, cursor, Extracted data panel, control bar)
 src/background.js     Service worker: drives a background "worker" tab when needed; toolbar badge count
 src/export.js         Builds the .xlsx with SheetJS
 popup/                Toolbar popup: page check, Start Scraping, live counter, Download Excel
@@ -46,11 +47,14 @@ There is no npm/webpack build step. The folder itself is the extension.
 
 ## How it works (and why)
 
-- **Result pages and detail pages are loaded with `fetch()` from inside the ingatlan.com tab.** The requests are same-origin and carry your cookies, including Cloudflare's clearance cookie, so they behave like normal browsing. Requests from outside a browser, such as curl or Python, get a 403 from Cloudflare.
-- **If a fetch is blocked** (Cloudflare challenge, 403), the page is loaded in a background **worker tab** instead. Cloudflare's automatic check usually passes by itself within a few seconds.
-- **"Confirm you are human" checks:** if Cloudflare asks you to tick the box, scraping **pauses**. The popup shows an orange *Please confirm you're human* banner, the icon badge shows **!**, and the check tab is brought to the front. Tick the box yourself; scraping continues automatically with no time limit, and nothing already collected is lost. The extension never tries to solve or bypass these checks.
+- **Two ways to run** (*Settings → Show the scraping live in this tab*):
+  - **Live (on by default):** the tab you started in opens every result page and listing itself, one after another, like a person browsing. Each page is animated while the extension reads it (see *Live view* below). The run's position is saved after every page, so the reloads don't lose anything. No other tab is opened.
+  - **Background (off):** the tab stays on the results page, and the other pages are loaded with `fetch()` from inside it. Nothing moves on screen, and it's faster. If a fetch is blocked (Cloudflare challenge, 403), the page is opened in one background **worker tab**, which is reused for the whole run.
+  Both send requests from inside your browser with your cookies, including Cloudflare's clearance cookie, so they behave like normal browsing. Requests from outside a browser, such as curl or Python, get a 403 from Cloudflare.
+- **"Confirm you are human" checks:** Cloudflare's automatic check usually passes by itself within a few seconds. If it asks you to tick the box, scraping **pauses**. In a live run the check simply shows in the tab, with a toast in the bottom-right corner; in a background run the worker tab is brought to the front. The popup shows an orange *Please confirm you're human* banner, the icon badge shows **!**, and a desktop notification appears. Tick the box yourself; scraping continues automatically with no time limit, and nothing already collected is lost. The extension never tries to solve or bypass these checks.
 - **Staying under the limit:** there are random 2.5–4 s pauses between requests, a 30–60 s break every 25 requests, and after every check or *429 Too Many Requests* the rest of the run gets slower (up to 4×). Revealing phone numbers causes the most checks. If you still see many, raise *Delay* in Settings (e.g. 5000 ms) or use the *Detailed* or *Quick* result type.
-- **Phone numbers** are hidden behind a button on ingatlan.com. With *Reveal phone numbers* on, every listing is opened in the worker tab, the button is clicked, and the number is read from the page. This is slower (a few seconds per listing), so a 400-listing search takes roughly 30–60 minutes.
+- **Phone numbers** are hidden behind a button on ingatlan.com. In *Full* mode every listing is opened (in the tab in a live run, in the worker tab otherwise), the button is clicked, and the number is read from the page. This is slower (a few seconds per listing), so a 400-listing search takes roughly 30–60 minutes.
+- **Live view:** on a result page, everything but the list is dimmed, every card is highlighted as it is captured, and a cursor "clicks" the next-page button before the tab opens the next page. On a listing, every value being read is spotlighted on the page and added to an *Extracted data* panel on the right; in Full mode the cursor clicks the phone button. The animations use the wait between requests (*Delay* in Settings), so they don't add to it; opening each page in full takes a little longer than a background fetch, though. The bottom bar has **Stop** and an eye button that hides the animation without stopping the run. If you open another page in that tab yourself, the run stops (download or continue from the popup).
 - **Progress is saved as it goes** (`chrome.storage.local`), so you can download what has been collected at any time, even after stopping. If you press Start again on the same search, listings whose details were already fetched are reused rather than fetched again.
 
 ## Install locally (developer mode)
@@ -72,7 +76,7 @@ After editing any file, click the **↻ reload** icon on the extension's card in
    |---|---|---|
    | **Quick** | Price, m², price/m², rooms, city/district, address, agency or private, labels | ≈ 1–2 min |
    | **Detailed** | Quick + floor, building levels, advertiser name, description and every listing parameter | ≈ 35–55 min |
-   | **Full** | Detailed + advertiser phone numbers (opens a background tab; don't close it) | ≈ 1–1.5 h |
+   | **Full** | Detailed + advertiser phone numbers (opens each listing and clicks its phone button) | ≈ 1–1.5 h |
 
    The estimate uses the result counter on the page (e.g. "412 találat") when there is one. Otherwise it uses the highest page number in the pagination. The pagination only shows nearby pages, so more pages can appear once the scan gets there. That is why the estimate is a minimum and the popup shows "page 7 of 21+" while scanning. In the details phase, the popup shows the time left based on the real speed so far.
 
@@ -155,7 +159,7 @@ ingatlan.com changes its HTML from time to time. All selectors and label texts a
 
 - `parseListPage`: results cards (`a.listing-card[data-listing-id]`), price, address, stats, next-page detection.
 - `parseDetailPage`: parameter tables / definition lists, floor (`LABELS.floor`), advertiser (`iroda.ingatlan.com` link or *Magánszemély* text).
-- `extractInPage` in `src/background.js`: how the "show phone number" button is found (`BUTTON_RE`) and where the number is read from.
+- `revealPhoneNumbers` in `src/parser.js`: how the "show phone number" button is found (`PHONE_BUTTON_RE`) and where the number is read from. Both the worker tab and the on-page listing window use it.
 
 To debug, open DevTools on the results page and run, for example:
 
