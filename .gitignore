@@ -1,3 +1,10 @@
 .idea/
 dist/
 node_modules/
+
+# Selenium scraper: local browser profile, results and settings
+selenium-scraper/.venv/
+selenium-scraper/chrome-profile/
+selenium-scraper/exports/
+selenium-scraper/settings.json
+__pycache__/

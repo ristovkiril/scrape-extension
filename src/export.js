@@ -64,10 +64,9 @@
     ws['!cols'] = COLUMNS.map((c) => ({ wch: c[2] })).concat(extraKeys.map(() => ({ wch: 16 })));
     ws['!autofilter'] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: data.length, c: header.length - 1 } }) };
 
-    const linkCol = header.indexOf('Link');
+    // Links stay plain text: a clickable hyperlink makes Excel fetch the URL itself first,
+    // ingatlan.com answers that with 403, and Excel then shows a bogus "malformed URI" error.
     for (let i = 0; i < data.length; i++) {
-      const linkCell = ws[XLSX.utils.encode_cell({ r: i + 1, c: linkCol })];
-      if (linkCell && linkCell.v) linkCell.l = { Target: linkCell.v };
       header.forEach((h, c) => {
         const fmt = NUMERIC_FORMAT[h];
         const cell = ws[XLSX.utils.encode_cell({ r: i + 1, c })];

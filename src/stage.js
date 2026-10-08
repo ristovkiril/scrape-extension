@@ -561,19 +561,6 @@
     ui.panel.classList.add('on');
   }
 
-  /** Animated click on an element on this page. The caller does the real click. */
-  async function click(el, label) {
-    if (!ui || document.hidden) return;
-    setStep('Revealing phone number…');
-    el.scrollIntoView({ block: 'center', behavior: 'auto' });
-    aim(ui.hole, el);
-    aim(ui.ring, el, label);
-    await wait(250);
-    await clickAt(el);
-    await wait(150);
-    hideCursor();
-  }
-
   const FIELD_PRIORITY = [
     [/emelet|floor|level/i, 4],
     [/szob|room|alapter|area/i, 3],
@@ -725,7 +712,6 @@
     humanCheck,
     scanList,
     openListing,
-    click,
     inspect,
     failed,
   };

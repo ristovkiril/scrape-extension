@@ -155,26 +155,17 @@ async function returnFromCheck(checkTabId, returnTabId) {
   } catch (_) {}
 }
 
-/**
- * Injected into the worker tab after src/parser.js. Optionally clicks the "show
- * phone number" button(s), then returns the page HTML and the phone numbers found.
- */
-async function extractInPage(revealPhone) {
-  const res = await self.IngatlanParser.revealPhoneNumbers(document, { click: revealPhone });
-  return { html: document.documentElement.outerHTML, ...res };
+/** Injected into the worker tab: returns the rendered page HTML. */
+function extractInPage() {
+  return { html: document.documentElement.outerHTML };
 }
 
-async function renderInWorker(url, revealPhone, resume, returnTabId) {
+async function renderInWorker(url, resume, returnTabId) {
   const tabId = await getWorkerTabId();
   if (!resume) await navigateAndWait(tabId, url);
   const { challenged, needsHuman } = await waitForChallenge(tabId, resume, returnTabId);
   if (needsHuman) return { needsHuman: true, challenged: true };
-  await chrome.scripting.executeScript({ target: { tabId }, files: ['src/parser.js'] });
-  const [{ result }] = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: extractInPage,
-    args: [!!revealPhone],
-  });
+  const [{ result }] = await chrome.scripting.executeScript({ target: { tabId }, func: extractInPage });
   return { ...result, challenged };
 }
 
@@ -294,7 +285,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
   if (msg.type === 'renderPage') {
-    renderInWorker(msg.url, msg.revealPhone, msg.resume, sender.tab && sender.tab.id)
+    renderInWorker(msg.url, msg.resume, sender.tab && sender.tab.id)
       .then((res) => sendResponse({ ok: true, ...res }))
       .catch((err) => sendResponse({ ok: false, error: String(err && err.message ? err.message : err) }));
     return true; // async response

@@ -138,7 +138,7 @@
     return m ? m[1] : '';
   }
 
-  function applyDetail(row, detail, workerPhones) {
+  function applyDetail(row, detail) {
     row.title = detail.title;
     row.floor = detail.floor;
     row.buildingLevels = detail.buildingLevels;
@@ -147,7 +147,7 @@
     row.agencyUrl = detail.agencyUrl;
     if (!row.sellerWebsite && detail.advertiserType) row.advertiserType = detail.advertiserType;
     row.advertiserName = detail.advertiserName || row.advertiserName;
-    row.phones = [...new Set([...(workerPhones || []), ...(detail.phones || [])])];
+    row.phones = detail.phones || [];
   }
 
   /** Does this row still need a visit to its listing page for the given options? */
@@ -511,14 +511,9 @@
       S.openListing(row, i + 1, total);
       try {
         if (!location.href.includes(id)) throw new Error('Listing not available');
-        let phones = [];
-        if (opts.revealPhones) {
-          await pause(800); // let the page's scripts set up the phone button
-          ({ phones } = await P.revealPhoneNumbers(document, { beforeClick: (b) => S.click(b, 'Show phone number') }));
-        }
         const detail = P.parseDetailPage(document);
         if (!detail.title && !Object.keys(detail.fields).length) throw new Error('Listing not available');
-        applyDetail(row, detail, phones);
+        applyDetail(row, detail);
         row.detailStatus = 'ok';
         if (opts.revealPhones) row.phoneChecked = true;
         animate = (ms) => S.inspect(row, detail, row.phones, ms);
@@ -567,10 +562,10 @@
    * check, the popup shows a banner and we keep waiting (without reloading the
    * check) until the user completes it or presses Stop.
    */
-  async function renderInWorker(url, revealPhone) {
-    let res = await chrome.runtime.sendMessage({ type: 'renderPage', url, revealPhone });
+  async function renderInWorker(url) {
+    let res = await chrome.runtime.sendMessage({ type: 'renderPage', url });
     while (res && res.ok && res.needsHuman && !stopRequested) {
-      res = await chrome.runtime.sendMessage({ type: 'renderPage', url, revealPhone, resume: true });
+      res = await chrome.runtime.sendMessage({ type: 'renderPage', url, resume: true });
     }
     if (stopRequested) throw new Error('Stopped');
     if (!res || !res.ok) throw new Error((res && res.error) || 'Worker tab failed');
@@ -585,30 +580,28 @@
    * Loads a page as a Document. Tries a same-origin fetch first (fast, uses the
    * user's cookies); falls back to loading it in the worker tab if blocked.
    */
-  async function loadPage(url, { revealPhone = false } = {}) {
-    if (!revealPhone) {
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          const res = await fetch(url, { credentials: 'include', headers: { Accept: 'text/html' } });
-          if (res.status === 429) {
-            noteBlocked();
-            await setStatus({ message: 'The site asked us to slow down, waiting 60 s…' });
-            await pause(60000);
-            continue;
-          }
-          if (res.ok) {
-            const html = await res.text();
-            if (!P.isChallengePage(html)) return { doc: toDoc(html), phones: [] };
-          }
-          noteBlocked(); // 403 / challenge page → the worker tab will show the check
-        } catch (_) {
-          // network error → fall through to the worker tab
+  async function loadPage(url) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const res = await fetch(url, { credentials: 'include', headers: { Accept: 'text/html' } });
+        if (res.status === 429) {
+          noteBlocked();
+          await setStatus({ message: 'The site asked us to slow down, waiting 60 s…' });
+          await pause(60000);
+          continue;
         }
-        break;
+        if (res.ok) {
+          const html = await res.text();
+          if (!P.isChallengePage(html)) return toDoc(html);
+        }
+        noteBlocked(); // 403 / challenge page → the worker tab will show the check
+      } catch (_) {
+        // network error → fall through to the worker tab
       }
+      break;
     }
-    const res = await renderInWorker(url, revealPhone);
-    return { doc: toDoc(res.html), phones: res.phones || [] };
+    const res = await renderInWorker(url);
+    return toDoc(res.html);
   }
 
   async function runInBackground({ kind, opts, job, rows }) {
@@ -623,7 +616,7 @@
         const viewingFirstPage = baseListUrl(location.href).href === base.href && pageOf(location.href) === 1;
         for (; page <= opts.maxPages && !stopRequested; page++) {
           await setStatus({ message: `Scanning ${pagesLabel(job, opts, page)}…`, page, lastPage: job.lastPageSeen, found: rows.length });
-          const { doc } = await loadPage(pageUrl(base, page));
+          const doc = await loadPage(pageUrl(base, page));
           let parsed = P.parseListPage(doc, page);
           if (page === 1 && !parsed.listings.length && viewingFirstPage) {
             // Fetched HTML had no cards (e.g. rendered client-side) — use the live page instead.
@@ -669,8 +662,7 @@
             etaMs: eta,
           });
           try {
-            const { doc, phones } = await loadPage(row.url, { revealPhone: opts.revealPhones });
-            applyDetail(row, P.parseDetailPage(doc), phones);
+            applyDetail(row, P.parseDetailPage(await loadPage(row.url)));
             row.detailStatus = 'ok';
             if (opts.revealPhones) row.phoneChecked = true;
           } catch (err) {

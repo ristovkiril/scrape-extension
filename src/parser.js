@@ -305,15 +305,28 @@
 
   function extractPhones(doc) {
     const phones = [];
-    doc.querySelectorAll('a[href^="tel:"]').forEach((a) => {
-      if (isInChrome(a)) return;
-      phones.push(normalizePhone(decodeURIComponent(a.getAttribute('href').slice(4))));
-    });
-    doc.querySelectorAll('[data-phone], [data-phone-number], [data-phonenumber]').forEach((el) => {
-      const v = el.getAttribute('data-phone') || el.getAttribute('data-phone-number') || el.getAttribute('data-phonenumber');
+    // The detail page ships the number in a hidden block (<span data-number="+36 30 123 4567">),
+    // so it can be read without clicking the "show phone number" button.
+    doc.querySelectorAll('[data-number], [data-phone], [data-phone-number], [data-phonenumber]').forEach((el) => {
+      if (isInChrome(el)) return;
+      const v = ['data-number', 'data-phone', 'data-phone-number', 'data-phonenumber'].map((a) => el.getAttribute(a)).find(Boolean);
       if (v && /\d{6,}/.test(v.replace(/\D/g, ''))) phones.push(normalizePhone(v));
     });
-    return uniq(phones);
+    doc.querySelectorAll('a[href^="tel:"]').forEach((a) => {
+      if (isInChrome(a)) return;
+      const raw = a.getAttribute('href').slice(4);
+      // Unfilled templates like "tel:%number%" aren't valid URI escapes; decodeURIComponent would throw.
+      try {
+        phones.push(normalizePhone(decodeURIComponent(raw)));
+      } catch (_) {}
+    });
+    // The same number often appears twice ("tel:+36301234567" and "+36 30 123 4567"): keep the first.
+    const byDigits = new Map();
+    phones.filter(Boolean).forEach((p) => {
+      const key = p.replace(/\D/g, '').replace(/^06/, '36');
+      if (!byDigits.has(key)) byDigits.set(key, p);
+    });
+    return [...byDigits.values()];
   }
 
   /**
@@ -354,55 +367,6 @@
     };
   }
 
-  // ---------- phone numbers on a live page ----------
-
-  const PHONE_BUTTON_RE = /telefonsz[aá]m|telefon|phone/i;
-
-  /**
-   * Clicks the "show phone number" button(s) and returns the numbers that appear.
-   * Needs the page's own scripts, so it only works on a live page (the worker tab or
-   * the on-page listing window), not on fetched HTML.
-   * @param {Document} doc
-   * @param {{ click?: boolean, beforeClick?: (button: Element) => Promise<void> }} [opts]
-   *   beforeClick runs before each click, e.g. to animate it.
-   */
-  async function revealPhoneNumbers(doc, { click = true, beforeClick } = {}) {
-    const inPageChrome = (el) => !!el.closest('header, footer, nav');
-    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-    const buttons = [...doc.querySelectorAll('button, a[role="button"], a[href="#"], [data-action*="phone" i]')].filter(
-      (b) =>
-        !inPageChrome(b) &&
-        !(b.getAttribute('href') || '').startsWith('tel:') &&
-        PHONE_BUTTON_RE.test(b.textContent + ' ' + (b.getAttribute('aria-label') || ''))
-    );
-
-    const collect = () => {
-      const found = [];
-      doc.querySelectorAll('a[href^="tel:"]').forEach((a) => {
-        if (!inPageChrome(a)) found.push(decodeURIComponent(a.getAttribute('href').slice(4)).trim());
-      });
-      const zones = buttons.map((b) => b.parentElement && b.parentElement.parentElement).filter(Boolean);
-      doc.querySelectorAll('.modal.show, [role="dialog"]').forEach((m) => zones.push(m));
-      zones.forEach((z) => (z.textContent.match(PHONE_RE) || []).forEach((p) => found.push(p.trim())));
-      return [...new Set(found)];
-    };
-
-    let clicked = 0;
-    if (click && buttons.length) {
-      const before = collect().length;
-      for (const b of buttons.slice(0, 2)) {
-        if (!b.isConnected) continue;
-        if (beforeClick) await beforeClick(b);
-        b.click();
-        clicked++;
-      }
-      for (let waited = 0; waited < 8000 && collect().length <= before; waited += 300) await sleep(300);
-      await sleep(300);
-    }
-    return { phones: collect(), clicked };
-  }
-
   // ---------- misc ----------
 
   function isChallengePage(html) {
@@ -416,7 +380,6 @@
     parseAddress,
     parsePrice,
     isChallengePage,
-    revealPhoneNumbers,
     PHONE_RE,
   };
 })(typeof window !== 'undefined' ? window : self);
